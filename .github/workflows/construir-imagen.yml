@@ -1,0 +1,220 @@
+name: construir-imagen
+
+# Solo construye la imagen de la aplicacion. No la publica ni despliega nada:
+# el registro y el despliegue son del pipeline `app`.
+#
+# Sirve para iterar sobre el Dockerfile del bloque A1 sin esperar al pipeline
+# completo ni tener credenciales de AWS cargadas. Reporta el tamano de cada
+# etapa y corre las dos comprobaciones del criterio de aceptacion:
+#
+#   1. docker history de la imagen construida no muestra ningun valor de
+#      credencial.
+#   2. La etapa final no lleva el arbol node_modules de la aplicacion ni usa
+#      el gestor de paquetes del sistema.
+#
+# Sobre la segunda: el binario dnf viene dentro de la imagen base de Lambda y
+# no se puede borrar de ahi. Lo que se comprueba es que la etapa final no lo
+# invoque, que es lo que mete herramientas de depuracion en la imagen que
+# corre en produccion.
+#
+# Condicion de detencion: fallo de construccion, o hallazgo en cualquiera de
+# las dos comprobaciones.
+
+on:
+  push:
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'src/**'
+      - 'package*.json'
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'src/**'
+      - 'package*.json'
+  workflow_dispatch:
+
+env:
+  APLICACION: inf384-lab3
+
+jobs:
+
+  construir:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Contexto de construccion
+        run: |
+          if [ -f .dockerignore ]; then
+            echo "Hay .dockerignore en la raiz."
+          else
+            echo "::warning::No hay .dockerignore en la raiz. Agregarlo es parte del bloque A1."
+          fi
+
+      # El tamano por etapa es lo que hace visible el efecto de la
+      # construccion en dos etapas: la de compilacion carga con el arbol de
+      # dependencias y la final solo con el artefacto empaquetado.
+      # Cada etapa se construye con --target y reutiliza el cache de la
+      # anterior, asi que no se construye nada dos veces.
+      - name: Construir cada etapa
+        env:
+          IMAGEN: ${{ env.APLICACION }}
+        run: |
+          set -euo pipefail
+
+          # Sin coincidencias el Dockerfile declara una sola etapa: no es un
+          # error, es el estado del repositorio antes del bloque A1.
+          etapas="$(grep -iE '^[[:space:]]*FROM[[:space:]].*[[:space:]]AS[[:space:]]+' Dockerfile \
+                    | sed -E 's/.*[[:space:]][Aa][Ss][[:space:]]+([^[:space:]]+).*/\1/' || true)"
+
+          : > etapas.txt
+          if [ -z "$etapas" ]; then
+            echo "::warning::El Dockerfile declara una sola etapa. La construccion en dos etapas es parte del bloque A1."
+          fi
+          for etapa in $etapas; do
+            echo "== etapa ${etapa}"
+            docker build --platform linux/amd64 --target "$etapa" --tag "${IMAGEN}:etapa-${etapa}" .
+            printf '%s\t%s\n' "$etapa" \
+              "$(docker image inspect "${IMAGEN}:etapa-${etapa}" --format '{{.Size}}' | numfmt --to=iec)" \
+              >> etapas.txt
+          done
+
+      # La misma plataforma y el mismo label que usa la publicacion, para que
+      # lo que se valida aqui sea lo mismo que despues se publica.
+      - name: Construir la imagen final
+        env:
+          IMAGEN: ${{ env.APLICACION }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --platform linux/amd64 \
+            --label "org.opencontainers.image.title=${IMAGEN}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --tag "${IMAGEN}:${GITHUB_SHA:0:7}" \
+            .
+          # Si la ultima etapa tiene nombre ya quedo medida arriba: la imagen
+          # final es esa misma etapa con los labels encima.
+          if ! grep -iE '^[[:space:]]*FROM[[:space:]]' Dockerfile | tail -1 \
+               | grep -qiE '[[:space:]]AS[[:space:]]+'; then
+            printf '%s\t%s\n' "(imagen final)" \
+              "$(docker image inspect "${IMAGEN}:${GITHUB_SHA:0:7}" --format '{{.Size}}' | numfmt --to=iec)" \
+              >> etapas.txt
+          fi
+
+      # Las dos comprobaciones corren juntas y el resumen se escribe siempre,
+      # pase o no pase: el hallazgo tiene que quedar visible en la ejecucion.
+      - name: Comprobaciones del criterio de aceptacion
+        env:
+          IMAGEN: ${{ env.APLICACION }}
+        run: |
+          set -uo pipefail
+          imagen="${IMAGEN}:${GITHUB_SHA:0:7}"
+          falla=0
+
+          {
+            echo '### Tamano por etapa'
+            echo
+            echo '| Etapa | Tamano |'
+            echo '|---|---|'
+            while IFS="$(printf '\t')" read -r etapa tamano; do
+              echo "| \`${etapa}\` | ${tamano} |"
+            done < etapas.txt
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # --- Comprobacion 1: credenciales en la historia de la imagen -----
+          # Cubre la historia completa y las variables de entorno que quedan
+          # declaradas en la imagen: las dos formas en que una credencial
+          # escrita en el Dockerfile sobrevive a la construccion.
+          patron='(PASSWORD|PASSWD|SECRET|TOKEN|CREDENTIAL|ACCESS_KEY|API_?KEY|PRIVATE_KEY)[A-Z0-9_]*=[^[:space:]"]'
+
+          {
+            docker history --no-trunc --format '{{.CreatedBy}}' "$imagen"
+            docker image inspect "$imagen" --format '{{range .Config.Env}}{{println .}}{{end}}'
+          } > historia.txt
+
+          if hallazgos="$(grep -iE "$patron" historia.txt)"; then
+            falla=1
+            echo "::error::Hay valores de credencial en la imagen construida."
+            {
+              echo '### Comprobacion 1: credenciales — HALLAZGO'
+              echo
+              echo 'Valores de credencial visibles en `docker history` o en el entorno de la imagen:'
+              echo
+              echo '```'
+              echo "$hallazgos" | cut -c1-200
+              echo '```'
+              echo
+              echo 'Borrar la linea no basta si la capa ya existe: la credencial se retira del Dockerfile y se rota en el origen.'
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo '### Comprobacion 1: credenciales — OK'
+              echo
+              echo '`docker history` y el entorno de la imagen no muestran ningun valor de credencial.'
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # --- Comprobacion 2: contenido de la etapa final ------------------
+          # El sistema de archivos se lee exportando el contenedor, no
+          # ejecutando comandos dentro: no depende de que la imagen traiga
+          # shell.
+          contenedor="$(docker create --platform linux/amd64 "$imagen")"
+          docker export "$contenedor" | tar -t > archivos.txt
+          docker rm -f "$contenedor" > /dev/null
+
+          # node_modules de la aplicacion. Lo que cuelga de /var/lang y de
+          # /var/runtime no cuenta: son los arboles de npm y del runtime que
+          # trae la imagen base de Lambda, y no se pueden quitar de ahi.
+          arboles="$(grep -E 'node_modules/' archivos.txt \
+                     | sed -E 's#(node_modules/).*#\1#' \
+                     | grep -vE '^(var/lang|var/runtime)/' \
+                     | sort -u)"
+
+          # Uso del gestor de paquetes del sistema en las capas de la imagen.
+          # La imagen base no invoca ninguno, asi que cualquier coincidencia
+          # sale de la etapa final del Dockerfile.
+          gestor="$(docker history --no-trunc --format '{{.CreatedBy}}' "$imagen" \
+                    | grep -iE '(dnf|yum|microdnf|rpm|apt-get|apk)[[:space:]]+(-[^[:space:]]+[[:space:]]+)*(install|-i)')"
+
+          if [ -n "$arboles" ] || [ -n "$gestor" ]; then
+            falla=1
+            echo "::error::La etapa final lleva node_modules de la aplicacion o instala paquetes del sistema."
+            {
+              echo '### Comprobacion 2: contenido de la etapa final — HALLAZGO'
+              echo
+              if [ -n "$arboles" ]; then
+                echo 'Arboles `node_modules` de la aplicacion en la etapa final:'
+                echo
+                echo '```'
+                echo "$arboles"
+                echo '```'
+                echo
+                echo 'La etapa final recibe unicamente `dist/handler.js`, el artefacto que deja `npm run build`.'
+                echo
+              fi
+              if [ -n "$gestor" ]; then
+                echo 'Instalaciones con el gestor de paquetes del sistema en las capas de la imagen:'
+                echo
+                echo '```'
+                echo "$gestor" | cut -c1-200
+                echo '```'
+                echo
+                echo 'Las herramientas de depuracion, si hacen falta, van en la etapa de construccion.'
+                echo
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo '### Comprobacion 2: contenido de la etapa final — OK'
+              echo
+              echo 'La etapa final no lleva `node_modules` de la aplicacion ni instala paquetes del sistema.'
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          exit "$falla"

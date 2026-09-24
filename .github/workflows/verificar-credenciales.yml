@@ -1,0 +1,83 @@
+name: verificar-credenciales
+
+# Comprueba que los tres secretos de la sesion del entorno academico estan
+# cargados y siguen vigentes. Se ejecuta a mano, antes de cada sesion de
+# trabajo, porque las credenciales caducan.
+
+on:
+  workflow_dispatch:
+
+jobs:
+
+  identidad:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comprobar que los tres secretos existen
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+        run: |
+          faltantes=""
+          [ -n "$AWS_ACCESS_KEY_ID" ]     || faltantes="${faltantes} AWS_ACCESS_KEY_ID"
+          [ -n "$AWS_SECRET_ACCESS_KEY" ] || faltantes="${faltantes} AWS_SECRET_ACCESS_KEY"
+          [ -n "$AWS_SESSION_TOKEN" ]     || faltantes="${faltantes} AWS_SESSION_TOKEN"
+          if [ -n "$faltantes" ]; then
+            echo "::error::Faltan secretos del repositorio:${faltantes}"
+            echo "Cargarlos en Settings > Secrets and variables > Actions con los tres" >&2
+            echo "valores de la sesion del entorno academico. Los tres son obligatorios:" >&2
+            echo "el token de sesion tambien, porque las credenciales son temporales." >&2
+            exit 1
+          fi
+          echo "Los tres secretos estan presentes."
+
+      - name: Credenciales temporales
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      # get-caller-identity no sirve para comprobar vigencia. AWS la responde
+      # sin pedir permisos y no se puede denegar: con la sesion ya cancelada
+      # sigue devolviendo la identidad. Se usa solo para mostrar quien llama.
+      - name: Identidad efectiva
+        run: aws sts get-caller-identity
+
+      # Esta es la comprobacion de verdad. Dos llamadas de solo lectura contra
+      # los dos servicios que usan los pipelines. Ambas exigen permisos, asi
+      # que ambas fallan si el entorno academico cancelo la sesion.
+      - name: Credenciales vigentes
+        run: |
+          probar() {
+            if salida="$("$@" 2>&1 >/dev/null)"; then
+              echo "  ok     $*"
+            else
+              echo "  falla  $*"
+              printf '%s\n' "$salida" | sed 's/^/         /'
+              return 1
+            fi
+          }
+
+          fallo=0
+          echo "Llamadas de prueba:"
+          probar aws ecr describe-repositories --max-items 1 || fallo=1
+          probar aws s3api list-buckets                      || fallo=1
+
+          if [ "$fallo" -ne 0 ]; then
+            echo "::error::Las credenciales estan cargadas pero AWS las rechaza."
+            {
+              echo "Causa habitual: la sesion del entorno academico termino. Al terminar,"
+              echo "el entorno cancela las credenciales que habia emitido, y desde ese"
+              echo "momento toda llamada falla con 'explicit deny ... voc-cancel-cred'."
+              echo "La sesion dura unas cuatro horas, asi que suele caerse a mitad del"
+              echo "trabajo, con los pipelines ya andando."
+              echo
+              echo "Solucion: abrir el laboratorio, Start Lab, AWS Details > AWS CLI, y"
+              echo "recargar los tres secretos del repositorio con los valores nuevos."
+              echo "Los tres cambian, AWS_SESSION_TOKEN incluido."
+            } >&2
+            exit 1
+          fi
+          echo "Credenciales vigentes."

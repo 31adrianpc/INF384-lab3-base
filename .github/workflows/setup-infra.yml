@@ -1,0 +1,238 @@
+name: setup-infra
+
+# Preparacion previa. Crea lo que el pipeline de infraestructura necesita para
+# poder correr, y solo eso:
+#
+#   1. el bucket de S3 donde vive el archivo de estado
+#   2. el repositorio privado de imagenes
+#   3. la imagen de marcador de posicion, con el tag bootstrap
+#
+# El resto (grupo de logs, politica de descarga y funcion) lo crea el pipeline
+# de infraestructura en su primera ejecucion. Una funcion Lambda de tipo imagen
+# exige que la imagen exista en el registro antes de crear la funcion: por eso
+# el paso 3 va antes, y por eso no puede hacerlo Terraform, que no publica
+# imagenes.
+#
+# Se ejecuta una sola vez, antes de la sesion. Es idempotente: volver a
+# ejecutarlo no rompe nada.
+#
+# Este workflow viene completo y no es parte del laboratorio.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bucket:
+        description: 'Nombre del bucket de estado. Convencion: inf384-tfstate-<su-codigo-pucp>'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  CLAVE_ESTADO: lab3/terraform.tfstate
+  APLICACION: inf384-lab3
+  TAG_INICIAL: bootstrap
+  IMAGEN_BASE: public.ecr.aws/lambda/nodejs:20
+
+jobs:
+
+  preparar:
+    runs-on: ubuntu-latest
+    env:
+      BUCKET: ${{ inputs.bucket }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Comprobar el nombre del bucket
+        run: |
+          if ! printf '%s' "$BUCKET" | grep -qE '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'; then
+            echo "::error::'${BUCKET}' no es un nombre de bucket valido."
+            echo "Entre 3 y 63 caracteres, en minuscula, sin espacios ni guion bajo." >&2
+            exit 1
+          fi
+
+      - name: Comprobar que los tres secretos existen
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+        run: |
+          faltantes=""
+          [ -n "$AWS_ACCESS_KEY_ID" ]     || faltantes="${faltantes} AWS_ACCESS_KEY_ID"
+          [ -n "$AWS_SECRET_ACCESS_KEY" ] || faltantes="${faltantes} AWS_SECRET_ACCESS_KEY"
+          [ -n "$AWS_SESSION_TOKEN" ]     || faltantes="${faltantes} AWS_SESSION_TOKEN"
+          if [ -n "$faltantes" ]; then
+            echo "::error::Faltan secretos del repositorio:${faltantes}"
+            exit 1
+          fi
+
+      - name: Credenciales temporales
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # El paso anterior no valida nada: carga los tres valores y sigue. Y
+      # get-caller-identity tampoco sirve, porque AWS la responde sin pedir
+      # permisos. Hace falta una llamada real, de solo lectura, para saber si
+      # la sesion del entorno academico sigue viva. Sin esto, unas credenciales
+      # canceladas se manifiestan mas abajo como un AccessDenied en mitad de un
+      # paso, o peor: head-bucket falla en silencio y el error que se ve es el
+      # de create-bucket.
+      - name: Comprobar que las credenciales siguen vigentes
+        run: |
+          if ! salida="$(aws s3api list-buckets 2>&1 >/dev/null)"; then
+            echo "::error::Las credenciales estan cargadas pero AWS las rechaza."
+            {
+              printf '%s\n' "$salida"
+              echo
+              echo "Lo habitual es que la sesion del entorno academico haya terminado."
+              echo "Al terminar, el entorno cancela las credenciales que emitio y toda"
+              echo "llamada pasa a fallar con 'explicit deny ... voc-cancel-cred'."
+              echo
+              echo "Abrir el laboratorio, Start Lab, AWS Details > AWS CLI, y recargar"
+              echo "los tres secretos del repositorio. Los tres cambian."
+            } >&2
+            exit 1
+          fi
+
+      # -------------------------------------------------------------------
+      # 1 · El bucket del archivo de estado
+      # -------------------------------------------------------------------
+
+      # us-east-1 es la unica region que no admite LocationConstraint.
+      - name: Crear el bucket
+        run: |
+          if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "El bucket ${BUCKET} ya existe. Nada que crear."
+          else
+            aws s3api create-bucket --bucket "$BUCKET" --region "$AWS_REGION"
+            echo "Bucket ${BUCKET} creado."
+          fi
+
+      # Sin versionado, un estado corrupto no tiene vuelta atras.
+      - name: Activar el versionado
+        run: |
+          aws s3api put-bucket-versioning \
+            --bucket "$BUCKET" \
+            --versioning-configuration Status=Enabled
+          echo "Versionado: $(aws s3api get-bucket-versioning --bucket "$BUCKET" --query Status --output text)"
+
+      # El archivo de estado lleva identificadores de cuenta y nombres de
+      # recurso. No tiene por que ser legible desde internet.
+      - name: Bloquear el acceso publico
+        run: |
+          aws s3api put-public-access-block \
+            --bucket "$BUCKET" \
+            --public-access-block-configuration \
+              BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+      - name: Cifrado en reposo
+        run: |
+          aws s3api put-bucket-encryption \
+            --bucket "$BUCKET" \
+            --server-side-encryption-configuration \
+              '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":true}]}'
+
+      # -------------------------------------------------------------------
+      # 2 · El repositorio de imagenes
+      # -------------------------------------------------------------------
+
+      # El repositorio no lo declara Terraform. Se crea aca, con la misma
+      # configuracion que tendria como recurso: tags mutables, porque el tag
+      # de ambiente se reasigna sobre el mismo manifiesto, y analisis al
+      # publicar.
+      - name: Crear el repositorio de imagenes
+        run: |
+          if aws ecr describe-repositories --repository-names "$APLICACION" >/dev/null 2>&1; then
+            echo "El repositorio ${APLICACION} ya existe. Nada que crear."
+          else
+            aws ecr create-repository \
+              --repository-name "$APLICACION" \
+              --image-tag-mutability MUTABLE \
+              --image-scanning-configuration scanOnPush=true \
+              --tags Key=Curso,Value=INF384 Key=Laboratorio,Value=3 "Key=Aplicacion,Value=${APLICACION}" \
+              >/dev/null
+            echo "Repositorio ${APLICACION} creado."
+          fi
+
+      # -------------------------------------------------------------------
+      # 3 · La imagen de marcador de posicion
+      # -------------------------------------------------------------------
+
+      - name: Entrar al registro
+        id: registro
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # La imagen no contiene la aplicacion. Existe solo para desbloquear la
+      # creacion de la funcion, y el pipeline de aplicacion la reemplaza en su
+      # primera publicacion.
+      #
+      # El paso es idempotente: si el tag ya existe, no vuelve a publicar.
+      # La plataforma es obligatoria: la funcion corre en x86_64 y una imagen
+      # construida para otra arquitectura falla recien al invocar.
+      - name: Publicar la imagen de marcador de posicion
+        env:
+          REGISTRO: ${{ steps.registro.outputs.registry }}
+        run: |
+          imagen="${REGISTRO}/${APLICACION}:${TAG_INICIAL}"
+
+          if aws ecr describe-images \
+               --repository-name "$APLICACION" \
+               --image-ids "imageTag=${TAG_INICIAL}" >/dev/null 2>&1; then
+            echo "La imagen ${imagen} ya existe. Nada que publicar."
+            exit 0
+          fi
+
+          contexto="$(mktemp -d)"
+
+          # Heredoc sin comillas: ${IMAGEN_BASE} lo expande el shell aqui, y
+          # \${LAMBDA_TASK_ROOT} queda literal para que lo resuelva Docker al
+          # construir.
+          cat > "${contexto}/Dockerfile" <<DOCKERFILE
+          FROM ${IMAGEN_BASE}
+          RUN printf 'exports.handler = async () => ({ ok: false, motivo: "imagen de marcador de posicion" });\n' \\
+                > "\${LAMBDA_TASK_ROOT}/handler.js"
+          CMD ["handler.handler"]
+          DOCKERFILE
+          cat "${contexto}/Dockerfile"
+
+          docker build --platform linux/amd64 --tag "$imagen" "$contexto"
+          docker push "$imagen"
+          rm -rf "$contexto"
+          echo "Publicada: ${imagen}"
+
+      - name: Lo que queda por hacer
+        run: |
+          url="$(aws ecr describe-repositories \
+                   --repository-names "$APLICACION" \
+                   --query 'repositories[0].repositoryUri' \
+                   --output text)"
+          {
+            echo '## Preparacion previa lista'
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Bucket de estado | \`${BUCKET}\` |"
+            echo "| Clave del estado | \`${CLAVE_ESTADO}\` |"
+            echo "| Repositorio de imagenes | \`${url}\` |"
+            echo "| Imagen inicial | \`${url}:${TAG_INICIAL}\` |"
+            echo
+            echo '### Falta un paso, y es manual'
+            echo
+            echo 'Crear `infra/backend.hcl` con este contenido exacto y **versionarlo**:'
+            echo
+            echo '```hcl'
+            echo "bucket = \"${BUCKET}\""
+            echo "key    = \"${CLAVE_ESTADO}\""
+            echo "region = \"${AWS_REGION}\""
+            echo '```'
+            echo
+            echo 'El pipeline de infraestructura lee ese archivo. Si no esta'
+            echo 'versionado, `terraform init` falla.'
+            echo
+            echo 'Ese mismo commit toca `infra/`, asi que dispara el pipeline de'
+            echo 'infraestructura, y su primera ejecucion crea el grupo de logs,'
+            echo 'la politica de descarga y la funcion.'
+          } >> "$GITHUB_STEP_SUMMARY"
