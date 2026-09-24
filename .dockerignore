@@ -1,0 +1,11 @@
+# El contexto de construccion lleva solo lo que la etapa build necesita:
+# el manifiesto, el lock file y el codigo fuente. Todo lo demas queda fuera
+# (.git, node_modules, dist, coverage, infra, workflows, archivos .env...).
+#
+# Lista de permitidos en vez de lista de excluidos: un archivo nuevo en el
+# repositorio no entra a la imagen salvo que se agregue aca a proposito.
+
+*
+!package.json
+!package-lock.json
+!src
