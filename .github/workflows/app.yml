@@ -88,30 +88,50 @@ jobs:
             -Dsonar.organization=${{ vars.SONAR_ORG }}
             -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
 
-      # Informativa: si la quality gate no pasa, el paso queda marcado pero
-      # el job sigue. El estado se lee en el resumen, sin abrir el log.
-      - name: Consultar la quality gate
-        id: gate
-        uses: SonarSource/sonarqube-quality-gate-action@v1
-        continue-on-error: true
-        timeout-minutes: 5
-
-      - name: Publicar el resultado de calidad
-        if: always()
+      # Informativa: espera a que SonarQube Cloud procese el analisis y lee
+      # el estado de la quality gate. Nunca detiene el job: el resultado se
+      # publica en el resumen y, si no es OK, como advertencia.
+      - name: Publicar el resultado de la quality gate
         env:
-          ESTADO: ${{ steps.gate.outputs.quality-gate-status }}
           PROYECTO: ${{ vars.SONAR_PROJECT_KEY }}
         run: |
-          url="https://sonarcloud.io/summary/new_code?id=${PROYECTO}"
-          if [ "$ESTADO" != "PASSED" ]; then
-            echo "::warning title=calidad::Quality gate de SonarQube Cloud: ${ESTADO:-sin resultado}. Detalle en ${url}"
+          set -u
+          reporte=.scannerwork/report-task.txt
+          url_tarea="$(sed -n 's/^ceTaskUrl=//p' "$reporte")"
+          url_panel="$(sed -n 's/^dashboardUrl=//p' "$reporte")"
+          auth="Authorization: Bearer ${SONAR_TOKEN}"
+
+          estado=""
+          analisis=""
+          for _ in $(seq 1 30); do
+            tarea="$(curl -s -H "$auth" "$url_tarea")"
+            estado_tarea="$(printf '%s' "$tarea" | jq -r '.task.status // empty' 2>/dev/null)"
+            case "$estado_tarea" in
+              SUCCESS) analisis="$(printf '%s' "$tarea" | jq -r '.task.analysisId')"; break ;;
+              FAILED|CANCELED) break ;;
+            esac
+            sleep 5
+          done
+
+          if [ -n "$analisis" ]; then
+            estado="$(curl -s -H "$auth" \
+                        "${SONAR_HOST_URL}/api/qualitygates/project_status?analysisId=${analisis}" \
+                      | jq -r '.projectStatus.status // empty')"
+          fi
+
+          if [ "$estado" != "OK" ]; then
+            echo "::warning title=calidad::Quality gate de SonarQube Cloud: ${estado:-sin resultado}. Detalle en ${url_panel}"
           fi
           {
             echo '## Calidad (SonarQube Cloud)'
             echo
-            echo "Quality gate: **${ESTADO:-sin resultado}**"
+            echo "Quality gate: **${estado:-sin resultado}** (informativo, no detiene)"
             echo
-            echo "Detalle: ${url}"
+            echo "Detalle: ${url_panel}"
+            if [ -z "$estado" ]; then
+              echo
+              echo "No se pudo leer el estado. Si la API responde 403, el token no tiene permiso de lectura sobre el proyecto: usar un token personal (My Account > Security)."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   # Secretos: credenciales escritas en el codigo y en TODO el historial.
@@ -233,8 +253,12 @@ jobs:
       - name: Publicar los hallazgos
         run: |
           total="$(jq '.results | length' semgrep.json)"
+          archivos="$(jq '.paths.scanned | length' semgrep.json)"
+          errores="$(jq '.errors | length' semgrep.json)"
           {
             echo '## Analisis estatico (semgrep)'
+            echo
+            echo "Archivos analizados: ${archivos}. Errores de la herramienta: ${errores}."
             echo
             if [ "$total" -gt 0 ]; then
               echo "**${total} hallazgo(s).** Informativo, no detiene."
