@@ -1,29 +1,38 @@
-# Dockerfile del repositorio base.
-# Contiene cinco malas practicas deliberadas. Cada una lleva su numero en la
-# linea anterior. Corregirlas es el bloque A1 de la guia del laboratorio.
+# Imagen de la funcion Lambda, construida en dos etapas.
+#
+# build   instala las dependencias desde el lock file y empaqueta el handler
+#         con esbuild en un solo archivo, dist/handler.js.
+# runtime recibe solo ese archivo. Sin node_modules, sin codigo fuente y sin
+#         herramientas: lo que corre en produccion es el artefacto empaquetado.
 
-# defecto 1
-FROM public.ecr.aws/lambda/nodejs:latest
+# Version fija de la imagen base (corrige defecto 1: tag movil 'latest').
+# La misma base en las dos etapas: el artefacto se construye con el mismo
+# Node que lo ejecuta.
+FROM public.ecr.aws/lambda/nodejs:20.2026.04.30.13 AS build
 
-# defecto 2
-COPY . .
+WORKDIR /build
 
-# defecto 3
-RUN npm install
+# Manifiesto y lock file antes del codigo (corrige defecto 2: COPY . .).
+# La capa de dependencias se reutiliza mientras el lock file no cambie.
+COPY package.json package-lock.json ./
 
-# defecto 4
-ENV DB_PASSWORD="inf384-clave-en-texto-plano"
+# Instalacion desde el lock file (corrige defecto 3: npm install).
+# Incluye devDependencies porque esbuild es una de ellas.
+RUN npm ci
 
-# defecto 5
-RUN dnf install -y procps-ng vim && dnf clean all
+COPY src ./src
+RUN npm run build
 
-### NO TOCAR DE ACA EN ADELANTE, CONSIDEREN QUE EL WORKDIR DEBE SER /build
-RUN npx esbuild src/handler.js \
-      --bundle --platform=node --target=node20 \
-      --outfile=dist/handler.js
 
-# Etapa final: recibe unicamente el artefacto empaquetado.
-# El arbol de node_modules se queda en la etapa anterior.
-FROM public.ecr.aws/lambda/nodejs:20 AS runtime
-COPY --from=build /build/dist/handler.js ${LAMBDA_TASK_ROOT}/
+FROM public.ecr.aws/lambda/nodejs:20.2026.04.30.13 AS runtime
+
+# Sin credenciales declaradas (corrige defecto 4). La configuracion llega
+# como variable de entorno de la funcion, declarada en infra/.
+#
+# Sin gestor de paquetes ni herramientas de depuracion (corrige defecto 5):
+# esta etapa no ejecuta ningun RUN.
+#
+# Solo el artefacto empaquetado pasa a la etapa final.
+COPY --from=build /build/dist/handler.js ${LAMBDA_TASK_ROOT}/handler.js
+
 CMD ["handler.handler"]
