@@ -113,10 +113,14 @@ jobs:
             sleep 5
           done
 
+          echo "Tarea de analisis: ${estado_tarea:-sin respuesta}"
           if [ -n "$analisis" ]; then
-            estado="$(curl -s -H "$auth" \
-                        "${SONAR_HOST_URL}/api/qualitygates/project_status?analysisId=${analisis}" \
-                      | jq -r '.projectStatus.status // empty')"
+            respuesta="$(curl -s -w '\n%{http_code}' -H "$auth" \
+                           "${SONAR_HOST_URL}/api/qualitygates/project_status?analysisId=${analisis}")"
+            echo "project_status: HTTP $(printf '%s' "$respuesta" | tail -n1)"
+            estado="$(printf '%s' "$respuesta" | sed '$d' | jq -r '.projectStatus.status // empty' 2>/dev/null)"
+          else
+            printf '%s\n' "$tarea" | head -c 300; echo
           fi
 
           if [ "$estado" != "OK" ]; then
@@ -255,6 +259,8 @@ jobs:
           total="$(jq '.results | length' semgrep.json)"
           archivos="$(jq '.paths.scanned | length' semgrep.json)"
           errores="$(jq '.errors | length' semgrep.json)"
+          echo "semgrep: ${total} hallazgo(s), ${archivos} archivo(s) analizados, ${errores} error(es)"
+          jq -r '.errors[]? | .message' semgrep.json | head -5
           {
             echo '## Analisis estatico (semgrep)'
             echo
